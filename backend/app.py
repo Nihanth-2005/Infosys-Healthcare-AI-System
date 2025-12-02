@@ -343,6 +343,39 @@ def init_db(db_path: str):
             FOREIGN KEY (workspace_id) REFERENCES workspaces(workspace_id)
         )
         ''')
+        # users table
+        c.execute('''
+        CREATE TABLE IF NOT EXISTS users (
+            user_id TEXT PRIMARY KEY,
+            name TEXT,
+            email TEXT,
+            created_at TEXT NOT NULL
+        )
+        ''')
+        # trained_models table
+        c.execute('''
+        CREATE TABLE IF NOT EXISTS trained_models (
+            model_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id TEXT NOT NULL,
+            model_filename TEXT NOT NULL,
+            accuracy REAL,
+            dataset_name TEXT,
+            created_at TEXT NOT NULL,
+            FOREIGN KEY (user_id) REFERENCES users(user_id)
+        )
+        ''')
+        # chat_history table
+        c.execute('''
+        CREATE TABLE IF NOT EXISTS chat_history (
+            chat_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id TEXT NOT NULL,
+            question_text TEXT NOT NULL,
+            reply_text TEXT NOT NULL,
+            domain TEXT,
+            timestamp TEXT NOT NULL,
+            FOREIGN KEY (user_id) REFERENCES users(user_id)
+        )
+        ''')
         conn.commit()
     finally:
         conn.close()
@@ -370,7 +403,7 @@ def create_app():
     # Configuration
     app.config['UPLOAD_FOLDER'] = os.getenv('UPLOAD_FOLDER', 'uploads')
     app.config['MODELS_FOLDER'] = os.getenv('MODELS_FOLDER', 'models')
-    app.config['DATABASE'] = os.getenv('DATABASE', 'workspace.db')
+    app.config['DATABASE'] = os.getenv('DATABASE', 'databases/workspace.db')
     app.config['MAX_CONTENT_LENGTH'] = 200 * 1024 * 1024  # 200 MB max upload
     app.config['USE_RASA_ONLY'] = os.getenv('USE_RASA_ONLY', 'false').lower() == 'true'
     app.config['RASA_URL'] = os.getenv('RASA_URL', 'http://localhost:5005')
@@ -480,6 +513,11 @@ def create_workspace():
             INSERT INTO workspaces (workspace_id, user_id, name, created_at)
             VALUES (?, ?, ?, ?)
         ''', (workspace_id, user_id, name, datetime.now().isoformat()))
+        # Insert user if not exists
+        c.execute('''
+            INSERT OR IGNORE INTO users (user_id, created_at)
+            VALUES (?, ?)
+        ''', (user_id, datetime.now().isoformat()))
         conn.commit()
         return jsonify({"success": True, "workspace_id": workspace_id})
     except sqlite3.IntegrityError:
@@ -567,6 +605,18 @@ def upload_dataset():
     workspace_id = request.form.get('workspace_id')
     algorithm = request.form.get('algorithm', 'RandomForestClassifier')
     automl_mode = request.form.get('automl_mode', 'false').lower() == 'true'
+
+    # Get user_id from workspace
+    conn_temp = get_db_connection(current_app.config['DATABASE'])
+    try:
+        c_temp = conn_temp.cursor()
+        c_temp.execute('SELECT user_id FROM workspaces WHERE workspace_id = ?', (workspace_id,))
+        row = c_temp.fetchone()
+        if not row:
+            return jsonify({"error": "Workspace not found"}), 404
+        user_id = row[0]
+    finally:
+        conn_temp.close()
 
     # Initialize progress
     with progress_lock:
@@ -756,6 +806,12 @@ def upload_dataset():
                 json.dumps(training_columns),
                 datetime.now().isoformat()
             ))
+            # Insert into trained_models
+            dataset_name = request.form.get('dataset_name', os.path.splitext(filename)[0])
+            c.execute('''
+                INSERT INTO trained_models (user_id, model_filename, accuracy, dataset_name, created_at)
+                VALUES (?, ?, ?, ?, ?)
+            ''', (user_id, model_path, accuracy, dataset_name, datetime.now().isoformat()))
             conn.commit()
         finally:
             try:
@@ -1587,6 +1643,32 @@ def chatbot():
     if not message:
         return jsonify({"error": "No message provided"}), 400
 
+    def insert_chat_history(user_id, question, reply, domain):
+        if not user_id:
+            return
+        conn = get_db_connection(current_app.config['DATABASE'])
+        try:
+            c = conn.cursor()
+            c.execute('''
+                INSERT INTO chat_history (user_id, question_text, reply_text, domain, timestamp)
+                VALUES (?, ?, ?, ?, ?)
+            ''', (user_id, question, reply, domain, datetime.now().isoformat()))
+            conn.commit()
+        finally:
+            conn.close()
+
+    # Get user_id from workspace
+    user_id = None
+    if workspace_id:
+        conn_temp = get_db_connection(current_app.config['DATABASE'])
+        try:
+            c_temp = conn_temp.cursor()
+            c_temp.execute('SELECT user_id FROM workspaces WHERE workspace_id = ?', (workspace_id,))
+            row = c_temp.fetchone()
+            user_id = row[0] if row else None
+        finally:
+            conn_temp.close()
+
     # Normalize input and remove common filler words
     text = re.sub(
         r"\b(i have|i am having|i feel|my|and|with|for|since|past|having|suffering from|suffering|experiencing|feeling|been|got|from|the|a|an)\b",
@@ -1600,6 +1682,7 @@ def chatbot():
     if domain != 'general':
         domain_response = handle_domain_specific_query(domain, message, text)
         if domain_response:
+            insert_chat_history(user_id, message, domain_response, domain)
             return jsonify({"success": True, "reply": domain_response})
 
     # Small-talk triggers (only for general domain)
@@ -1614,6 +1697,7 @@ def chatbot():
         }
         for pattern, resp in smalltalk_map.items():
             if re.search(pattern, text):
+                insert_chat_history(user_id, message, resp, domain)
                 return jsonify({"success": True, "reply": resp})
     else:
         # Domain-specific greetings
@@ -1626,7 +1710,9 @@ def chatbot():
         greeting_patterns = [r"^(hi|hello|hey|yo|hola|namaste)\b", r"how are you\??", r"who are you\??", r"help|what can you do"]
         for pattern in greeting_patterns:
             if re.search(pattern, text):
-                return jsonify({"success": True, "reply": domain_greetings.get(domain, "Hello! How can I help you today?")})
+                resp = domain_greetings.get(domain, "Hello! How can I help you today?")
+                insert_chat_history(user_id, message, resp, domain)
+                return jsonify({"success": True, "reply": resp})
 
     # Only process symptom prediction for general domain
     if domain == 'general':
@@ -1644,9 +1730,13 @@ def chatbot():
                     rasa_entities = parsed.get('entities') or []
                     intent_name = (parsed.get('intent') or {}).get('name') or ''
                     if intent_name in ('greet', 'chitchat', 'smalltalk.greet'):
-                        return jsonify({"success": True, "reply": "Hello! How can I help you today?"})
+                        resp = "Hello! How can I help you today?"
+                        insert_chat_history(user_id, message, resp, domain)
+                        return jsonify({"success": True, "reply": resp})
                     if intent_name in ('bot_challenge', 'who_are_you'):
-                        return jsonify({"success": True, "reply": "I'm your AI health assistant. Describe symptoms like 'headache and jaw pain for 2 days'."})
+                        resp = "I'm your AI health assistant. Describe symptoms like 'headache and jaw pain for 2 days'."
+                        insert_chat_history(user_id, message, resp, domain)
+                        return jsonify({"success": True, "reply": resp})
                 except Exception:
                     return jsonify({"error": "Rasa NLU is unreachable or failed to parse."}), 502
 
@@ -1831,6 +1921,7 @@ def chatbot():
                     f"I noticed only one symptom: {single_symptom}. "
                     f"Please share if you have any other symptoms (e.g., fever, cough, nausea) for a more accurate assessment."
                 )
+                insert_chat_history(user_id, message, prompt_more, domain)
                 return jsonify({
                     "success": True,
                     "reply": prompt_more,
@@ -1875,6 +1966,7 @@ def chatbot():
             disclaimer_line = "\nPlease consult a medical professional for confirmation."
             reply = f"{prefix}the predicted condition is {prediction}.{rag_suffix}{conf_text_line}{disclaimer_line}"
 
+            insert_chat_history(user_id, message, reply, domain)
             return jsonify({
                 "success": True,
                 "reply": reply,
